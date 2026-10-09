@@ -1,0 +1,2068 @@
+#!/usr/bin/env python3
+"""cascada — gestor de ficheros de consola: columnas en cascada como el Finder, con aire de MS-DOS.
+
+Uso:
+  cascada [RUTA]       abre RUTA (o la carpeta actual)
+  cascada --shell      imprime la función de bash para que, al salir, la terminal se quede
+                       en la carpeta donde estabas (ver README)
+  cascada --tema T     arranca con ese tema: dos, noche, ambar o fosforo
+
+Dentro del programa, F1 (o ?) enseña todas las teclas.
+"""
+import argparse
+import curses
+import json
+import locale
+import os
+import pwd
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import textwrap
+import threading
+import time
+import unicodedata
+import urllib.parse
+import warnings
+import zipfile
+from collections import OrderedDict
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "1.0"
+HOME = str(Path.home())
+ESTADO = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "cascada" / "estado.json"
+
+ORDENES = ("nombre", "fecha", "tamaño", "tipo")
+IMAGENES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".ico", ".ppm", ".pgm"}
+ZIPS = (".zip", ".jar", ".apk", ".nupkg", ".whl", ".aar", ".epub", ".vsix")
+TARS = (".tar", ".tgz", ".tar.gz", ".txz", ".tar.xz", ".tbz2", ".tar.bz2", ".tar.zst")
+OTROS_ARCHIVOS = (".7z", ".rar", ".iso", ".deb", ".rpm", ".cab")
+FS_RED = {"nfs", "nfs4", "cifs", "smb3", "fuse.sshfs", "fuse.rclone", "davfs", "9p"}
+
+FUNCION_SHELL = """\
+# cascada: al salir con q, la terminal se queda en la carpeta donde estabas.
+cascada() {
+    local f d
+    f="$(mktemp -t cascada.XXXXXX)" || return
+    command cascada --elegir-dir "$f" "$@"
+    d="$(cat -- "$f" 2>/dev/null)"
+    rm -f -- "$f"
+    [ -n "$d" ] && [ "$d" != "$PWD" ] && cd -- "$d"
+}"""
+
+AYUDA = """\
+
+  MOVERSE
+    ↑ ↓  (k j)              subir y bajar
+    →  (l)                  entrar en la carpeta
+    ←  (h, Retroceso)       volver a la carpeta de arriba
+    Intro                   entrar en la carpeta o abrir el fichero con su programa
+    RePág AvPág Inicio Fin  saltar por la lista
+    ~                       carpeta personal
+    -                       carpeta en la que estabas antes
+    g                       ir a una ruta (Tab completa)
+    F9  (u)                 sitios: carpetas favoritas y discos montados
+    b                       poner o quitar esta carpeta de favoritos
+    Ratón                   clic selecciona, doble clic abre, la rueda desplaza;
+                            también vale pulsar en la barra de teclas de abajo
+
+  VER
+    /                       filtrar la lista según escribes
+    Esc                     quitar el filtro; si no lo hay, las marcas; si no, lo copiado
+    .                       enseñar u ocultar los ficheros ocultos
+    s                       cambiar el orden: nombre, fecha, tamaño, tipo
+    F3  (v)                 ver el fichero a pantalla completa
+    R  (Ctrl+L)             volver a leer las carpetas y repintar
+    T                       cambiar de tema: dos, noche, ámbar, fósforo
+
+  FICHEROS
+    Espacio                 marcar o desmarcar y bajar
+    a   *                   marcar todo · invertir las marcas
+    F2  (r)                 renombrar
+    F4  (e)                 editar con $EDITOR
+    F5  F6                  copiar · mover, escribiendo el destino
+    c   x   p               copiar · cortar · pegar en la carpeta actual
+    F7  (n)                 carpeta nueva (el MkDir de toda la vida)
+    F8  (Supr, d)           enviar a la papelera
+    Mayús+Supr              borrar definitivamente
+    S   !                   abrir una shell en esta carpeta
+
+  SALIR
+    F10 (q)                 salir (y dejar la terminal en esta carpeta, ver README)
+    Q                       salir sin cambiar de carpeta
+
+  Las operaciones actúan sobre lo marcado o, si no hay marcas, sobre el cursor.
+  Si la terminal se queda con F1 o F10, usa la letra entre paréntesis.
+"""
+
+# ── Temas ────────────────────────────────────────────────────────────────────────────────────
+# Colores por índice fijo de la paleta de 256 (no se toca la paleta de la terminal).
+# Cada papel: (tinta, fondo[, atributos]).
+
+_N = curses.A_BOLD
+_AZ, _CI, _GR = 19, 37, 248  # azul, cian y gris claro de la paleta de la VGA
+
+TEMAS = {
+    "dos": {
+        "base": (87, _AZ), "borde": (87, _AZ), "barra": (16, _CI), "barra_res": (227, 16, _N),
+        "cab": (_GR, _AZ), "cab_act": (227, _AZ, _N),
+        "dir": (231, _AZ, _N), "fich": (87, _AZ), "exe": (83, _AZ), "link": (207, _AZ),
+        "roto": (203, _AZ), "oculto": (_CI, _AZ), "marcado": (227, _AZ, _N),
+        "cursor": (16, _CI), "cursor_marc": (227, _CI, _N), "camino": (16, _GR),
+        "tenue": (_CI, _AZ), "estado": (231, _AZ), "fnum": (_GR, 16), "ftxt": (16, _CI),
+        "dlg": (16, _GR), "dlg_tenue": (240, _GR), "dlg_btn_sel": (231, 16, _N),
+        "dlg_campo": (16, _CI), "dlg_err": (231, 124, _N), "sombra": (240, 16),
+        "txt": (231, _AZ), "kw": (227, _AZ, _N), "str": (83, _AZ), "com": (_GR, _AZ),
+        "num": (207, _AZ), "fn": (87, _AZ), "hex_off": (_CI, _AZ),
+    },
+    "noche": {
+        "base": (252, 234), "borde": (240, 234), "barra": (16, 75), "barra_res": (231, 25, _N),
+        "cab": (244, 234), "cab_act": (75, 234, _N),
+        "dir": (75, 234, _N), "fich": (252, 234), "exe": (114, 234), "link": (176, 234),
+        "roto": (203, 234), "oculto": (243, 234), "marcado": (220, 234, _N),
+        "cursor": (16, 75), "cursor_marc": (16, 220), "camino": (255, 238),
+        "tenue": (243, 234), "estado": (250, 234), "fnum": (75, 234, _N), "ftxt": (252, 238),
+        "dlg": (252, 238), "dlg_tenue": (246, 238), "dlg_btn_sel": (16, 75),
+        "dlg_campo": (255, 16), "dlg_err": (231, 124, _N), "sombra": (238, 16),
+        "txt": (252, 234), "kw": (176, 234), "str": (114, 234), "com": (243, 234),
+        "num": (215, 234), "fn": (75, 234), "hex_off": (243, 234),
+    },
+}
+
+
+def _monocromo(claro, medio, oscuro, fondo=16):
+    """Tema de monitor de fósforo: una sola tinta en tres intensidades."""
+    t = dict.fromkeys(TEMAS["dos"], (medio, fondo))
+    for papel in ("dir", "cab_act", "marcado", "kw", "fn"):
+        t[papel] = (claro, fondo, _N)
+    for papel in ("oculto", "tenue", "com", "hex_off", "cab", "borde", "sombra", "roto"):
+        t[papel] = (oscuro, fondo)
+    for papel in ("cursor", "barra", "ftxt", "dlg", "dlg_tenue"):
+        t[papel] = (fondo, medio)
+    t.update(barra_res=(claro, fondo, _N), cursor_marc=(fondo, claro, _N), camino=(fondo, oscuro),
+             fnum=(claro, fondo), dlg_btn_sel=(claro, fondo, _N), dlg_campo=(claro, fondo),
+             dlg_err=(fondo, claro, _N), txt=(medio, fondo))
+    return t
+
+
+TEMAS["ambar"] = _monocromo(220, 214, 130)
+TEMAS["fosforo"] = _monocromo(120, 40, 28)
+ZONA_IMG = 80  # pares de color 1..79 para el tema; de aquí a 255, para las imágenes
+
+# ── Utilidades de texto ──────────────────────────────────────────────────────────────────────
+
+_CONTROL = {i: "·" for i in range(32) if i != 10} | {127: "·"}
+_NUM = re.compile(r"([0-9]+)")
+
+
+def ancho_car(c):
+    if ord(c) < 0x300:
+        return 1
+    if unicodedata.combining(c) or unicodedata.category(c) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in "WF" else 1
+
+
+def ancho(s):
+    """Columnas que ocupa s en pantalla."""
+    return len(s) if s.isascii() else sum(map(ancho_car, s))
+
+
+def recorta(s, w, puntos="…"):
+    """s cortado a w columnas como mucho."""
+    if w <= 0:
+        return ""
+    if ancho(s) <= w:
+        return s
+    tope, a, out = w - len(puntos), 0, []
+    for c in s:
+        a += ancho_car(c)
+        if a > tope:
+            break
+        out.append(c)
+    return "".join(out) + puntos
+
+
+def recorta_nombre(nombre, w):
+    """Como recorta, pero deja la extensión a la vista: «informe lar….pdf»."""
+    if ancho(nombre) <= w:
+        return nombre
+    raiz, ext = os.path.splitext(nombre)
+    if ext and raiz and ancho(ext) <= 8 and w >= ancho(ext) + 4:
+        return recorta(raiz, w - ancho(ext)) + ext
+    return recorta(nombre, w)
+
+
+def ajusta(s, w):
+    return s + " " * (w - ancho(s))
+
+
+def limpia(s):
+    """Nombre apto para la pantalla: sin caracteres de control ni bytes sueltos."""
+    if s.isascii() and s.isprintable():
+        return s
+    return "".join(c if c.isprintable() else "" if unicodedata.category(c) == "Cf" else "?" for c in s)
+
+
+def sin_acentos(s):
+    if s.isascii():
+        return s
+    return "".join(c for c in unicodedata.normalize("NFD", s) if not unicodedata.combining(c))
+
+
+def clave_natural(s):
+    """Orden natural y sin distinguir mayúsculas ni acentos: img2 antes que img10."""
+    partes = _NUM.split(sin_acentos(s.casefold()))
+    return [(0, int(p), "") if i % 2 else (1, 0, p) for i, p in enumerate(partes) if p]
+
+
+def humano(n):
+    if n < 1024:
+        return f"{n} B"
+    for u in ("KB", "MB", "GB", "TB"):
+        n /= 1024
+        if n < 1024 or u == "TB":
+            return (f"{n:.1f}" if n < 100 else f"{n:.0f}").replace(".", ",") + " " + u
+
+
+def fecha(ts):
+    try:
+        return datetime.fromtimestamp(ts).strftime("%d/%m/%Y %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return "?"
+
+
+def cuenta(n, uno="elemento", varios="elementos"):
+    return f"{n} {uno if n == 1 else varios}"
+
+
+def abrevia(ruta):
+    if ruta == HOME or ruta.startswith(HOME + "/"):
+        return "~" + ruta[len(HOME):]
+    return ruta
+
+
+_duenos = {}
+
+
+def dueno(uid):
+    if uid not in _duenos:
+        try:
+            _duenos[uid] = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            _duenos[uid] = str(uid)
+    return _duenos[uid]
+
+
+def corre(args, espera=3):
+    """Salida de un programa auxiliar, o None si falla o tarda demasiado."""
+    try:
+        r = subprocess.run(args, capture_output=True, timeout=espera, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+
+
+# ── Carpetas ─────────────────────────────────────────────────────────────────────────────────
+
+class Entrada:
+    __slots__ = ("nombre", "ruta", "es_dir", "es_link", "_st", "_vis", "_clave")
+
+    def __init__(self, de):
+        self.nombre, self.ruta = de.name, de.path
+        try:
+            self.es_link = de.is_symlink()
+        except OSError:
+            self.es_link = False
+        try:
+            self.es_dir = de.is_dir()
+        except OSError:
+            self.es_dir = False
+        self._st = self._vis = self._clave = None
+
+    @property
+    def st(self):
+        """stat del fichero (del destino si es un enlace); se pide solo cuando hace falta."""
+        if self._st is None:
+            try:
+                self._st = os.stat(self.ruta)
+            except OSError:
+                try:
+                    self._st = os.lstat(self.ruta)
+                except OSError:
+                    self._st = False
+        return self._st or None
+
+    @property
+    def visible(self):
+        if self._vis is None:
+            self._vis = limpia(self.nombre)
+        return self._vis
+
+    @property
+    def clave(self):
+        if self._clave is None:
+            self._clave = sin_acentos(self.nombre.casefold())
+        return self._clave
+
+    @property
+    def tam(self):
+        return self.st.st_size if self.st else 0
+
+    @property
+    def mtime(self):
+        return self.st.st_mtime if self.st else 0
+
+    @property
+    def roto(self):
+        return self.es_link and (self.st is None or stat.S_ISLNK(self.st.st_mode))
+
+    @property
+    def exe(self):
+        return not self.es_dir and self.st is not None and bool(self.st.st_mode & 0o111)
+
+
+def clave_orden(orden):
+    if orden == "fecha":
+        return lambda e: (not e.es_dir, -e.mtime, clave_natural(e.nombre))
+    if orden == "tamaño":
+        return lambda e: (not e.es_dir, 0 if e.es_dir else -e.tam, clave_natural(e.nombre))
+    if orden == "tipo":
+        return lambda e: (not e.es_dir, "" if e.es_dir else os.path.splitext(e.nombre)[1].casefold(),
+                          clave_natural(e.nombre))
+    return lambda e: (not e.es_dir, clave_natural(e.nombre))
+
+
+class Listado:
+    """Contenido de una carpeta, ya ordenado. Nunca entra en subcarpetas."""
+
+    def __init__(self, ruta, ocultos, orden):
+        self.ruta, self.error, self.entradas = ruta, None, []
+        try:
+            self.mtime = os.stat(ruta).st_mtime_ns
+        except OSError:
+            self.mtime = None
+        try:
+            with os.scandir(ruta) as it:
+                self.entradas = [Entrada(d) for d in it if ocultos or not d.name.startswith(".")]
+        except PermissionError:
+            self.error = "sin permiso"
+        except OSError as e:
+            self.error = e.strerror or str(e)
+        self.entradas.sort(key=clave_orden(orden))
+        self.indice = {e.nombre: i for i, e in enumerate(self.entradas)}
+
+
+# ── Vista previa ─────────────────────────────────────────────────────────────────────────────
+
+class Vista:
+    """Líneas listas para pintar: cada una es una lista de (texto, papel)."""
+    __slots__ = ("lineas", "info")
+
+    def __init__(self, lineas, info=""):
+        self.lineas, self.info = lineas, info
+
+
+def nota(texto, w=200):
+    return [[]] + [[(lin, "tenue")] for lin in textwrap.wrap(f"({texto})", max(10, w - 1))]
+
+
+def decodifica(datos):
+    """Texto del fichero, o None si es binario."""
+    if datos.startswith(b"\xef\xbb\xbf"):
+        return datos[3:].decode("utf-8", "replace")
+    if datos[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return datos.decode("utf-16", "replace")
+    cabeza = datos[:8192]
+    if b"\0" in cabeza:
+        return None
+    try:
+        return datos.decode("utf-8")
+    except UnicodeDecodeError as e:
+        if e.start >= len(datos) - 4:  # carácter partido por leer solo el principio
+            return datos.decode("utf-8", "ignore")
+    if sum(b < 9 or 13 < b < 32 for b in cabeza) > len(cabeza) // 20:
+        return None
+    return datos.decode("cp1252", "replace")
+
+
+_papeles = {}
+
+
+def papel_de(tt):
+    """Papel de color para un tipo de token de pygments."""
+    p = _papeles.get(tt)
+    if p is None:
+        from pygments.token import Comment, Generic, Keyword, Name, Number, Operator, String
+        if tt in Comment:
+            p = "com"
+        elif tt in Keyword or tt in Operator.Word or tt in Generic.Heading or tt in Generic.Subheading:
+            p = "kw"
+        elif tt in String or tt in Generic.Inserted:
+            p = "str"
+        elif tt in Number or tt in Name.Attribute or tt in Name.Constant:
+            p = "num"
+        elif tt in Name.Function or tt in Name.Class or tt in Name.Decorator or tt in Name.Tag:
+            p = "fn"
+        elif tt in Generic.Deleted or tt in Generic.Error:
+            p = "roto"
+        else:
+            p = "txt"
+        _papeles[tt] = p
+    return p
+
+
+def resalta(texto, nombre):
+    """(líneas coloreadas, nombre del lenguaje). Sin pygments o sin lexer, texto liso."""
+    try:
+        from pygments.lexers import TextLexer, get_lexer_for_filename
+        lexer = get_lexer_for_filename(nombre, stripnl=False, ensurenl=False)
+        if isinstance(lexer, TextLexer):
+            raise ValueError
+        lineas = [[]]
+        for tt, val in lexer.get_tokens(texto):
+            papel = papel_de(tt)
+            for i, trozo in enumerate(val.split("\n")):
+                if i:
+                    lineas.append([])
+                if trozo:
+                    lineas[-1].append((trozo, papel))
+        return lineas, lexer.name
+    except Exception:  # ClassNotFound, o un lexer que tropieza: se enseña sin colores
+        return [[(lin, "txt")] for lin in texto.split("\n")], ""
+
+
+def vista_texto(texto, nombre, cortado, completa):
+    texto = texto.replace("\r\n", "\n").replace("\r", "\n").expandtabs(4).translate(_CONTROL)
+    texto = texto.removesuffix("\n")
+    if len(texto) <= 300_000:
+        lineas, lenguaje = resalta(texto, nombre)
+    else:
+        lineas, lenguaje = [[(lin, "txt")] for lin in texto.split("\n")], ""
+    info = f"{len(lineas)}+ líneas" if cortado else cuenta(len(lineas), "línea", "líneas")
+    if cortado and completa:
+        lineas += [[], [("(el fichero sigue; solo se enseña el principio)", "tenue")]]
+    return Vista(lineas, f"{lenguaje} · {info}" if lenguaje else info)
+
+
+def volcado(datos, por_fila):
+    lineas = []
+    for i in range(0, len(datos), por_fila):
+        fila = datos[i:i + por_fila]
+        hexa = " ".join(f"{b:02X}" for b in fila)
+        if por_fila == 16:
+            hexa = hexa[:23] + " " + hexa[23:]
+        letras = "".join(chr(b) if 32 <= b < 127 else "·" for b in fila)
+        lineas.append([(f"{i:08X}  ", "hex_off"), (ajusta(hexa, por_fila * 3 + 1), "txt"), (letras, "str")])
+    return lineas
+
+
+def vista_binaria(ruta, datos, w, completa):
+    desc = (corre(["file", "-b", ruta], 2) or "fichero binario").strip()
+    lineas = [[(lin, "kw")] for lin in textwrap.wrap(desc, max(20, w - 2))] + [[]]
+    lineas += volcado(datos[:262_144 if completa else 1024], 16 if w >= 78 else 8)
+    return Vista(lineas, "binario")
+
+
+def rgb256(r, g, b):
+    """Índice de la paleta de 256 más cercano a un color."""
+    def q(v):
+        return 0 if v < 48 else 1 if v < 115 else (v - 35) // 40
+    niveles = (0, 95, 135, 175, 215, 255)
+    qr, qg, qb = q(r), q(g), q(b)
+    gris = (r + g + b) // 3
+    gi = 0 if gris < 8 else 23 if gris > 238 else (gris - 8) // 10
+    gv = 8 + 10 * gi
+    d_cubo = (r - niveles[qr]) ** 2 + (g - niveles[qg]) ** 2 + (b - niveles[qb]) ** 2
+    d_gris = (r - gv) ** 2 + (g - gv) ** 2 + (b - gv) ** 2
+    return 232 + gi if d_gris < d_cubo else 16 + 36 * qr + 6 * qg + qb
+
+
+def vista_imagen(ruta, w, h):
+    """La imagen con medios bloques (▀) y 16 colores, como en una EGA. None si no se puede."""
+    try:
+        from PIL import Image
+        with Image.open(ruta) as im:
+            tam, formato = im.size, im.format
+            im.draft("RGB", (w * 2, h * 4))
+            alfa = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+            im = im.convert("RGBA" if alfa else "RGB")
+            im.thumbnail((max(1, w), max(2, h * 2)))
+            if alfa:
+                im = Image.alpha_composite(Image.new("RGBA", im.size, (48, 48, 48, 255)), im).convert("RGB")
+            # Paleta de 16 colores a medida de la imagen y, con ella, tramado como en los 90.
+            im = im.quantize(palette=im.quantize(colors=16), dither=Image.Dither.FLOYDSTEINBERG)
+            paleta = im.getpalette() or []
+            px, (aw, ah) = im.load(), im.size
+    except Exception:  # formato raro, imagen rota, sin Pillow…
+        return None
+    color = [rgb256(*paleta[i:i + 3]) for i in range(0, len(paleta) - 2, 3)]
+    sangria = " " * ((w - aw) // 2)
+    lineas = []
+    for y in range(0, ah, 2):
+        linea, previo, n = [(sangria, "txt")] if sangria else [], None, 0
+        for x in range(aw):
+            a = color[px[x, y]]
+            b = color[px[x, y + 1]] if y + 1 < ah else -1
+            # Un par (tinta, fondo) sirve para las dos orientaciones: ▀ y ▄.
+            celda = ("▀", (a, -1)) if b < 0 else (" ", (a, a)) if a == b else \
+                ("▀", (a, b)) if a < b else ("▄", (b, a))
+            if celda == previo:
+                n += 1
+                continue
+            if previo:
+                linea.append((previo[0] * n, previo[1]))
+            previo, n = celda, 1
+        linea.append((previo[0] * n, previo[1]))
+        lineas.append(linea)
+    return Vista(lineas, f"{formato} {tam[0]}×{tam[1]}")
+
+
+def vista_pdf(ruta, completa):
+    args = ["pdftotext", "-l", "30" if completa else "2", "-nopgbrk"] + (["-layout"] if completa else [])
+    salida = corre(args + [ruta, "-"], 6 if completa else 2)
+    if salida is None:
+        return None
+    if not salida.strip():
+        return Vista(nota("PDF sin texto, seguramente escaneado"), "PDF")
+    return Vista([[(lin, "txt")] for lin in salida.translate(_CONTROL).rstrip("\n").split("\n")], "PDF")
+
+
+def vista_archivo(ruta, nombre, completa):
+    """Lo que hay dentro de un comprimido."""
+    tope, filas, total = (5000 if completa else 300), [], None
+    try:
+        if nombre.endswith(ZIPS):
+            with zipfile.ZipFile(ruta) as z:
+                dentro = z.infolist()
+                total = len(dentro)
+                filas = [(i.file_size, i.filename) for i in dentro[:tope]]
+        elif nombre.endswith(TARS):
+            t0 = time.monotonic()
+            with tarfile.open(ruta) as t:
+                for m in t:
+                    filas.append((m.size, m.name + ("/" if m.isdir() else "")))
+                    if len(filas) >= tope or time.monotonic() - t0 > 1.5:
+                        break
+                else:
+                    total = len(filas)
+        else:
+            salida = corre(["7z", "l", "-ba", ruta], 4)
+            if salida is None:
+                return None
+            return Vista([[(lin, "txt")] for lin in salida.translate(_CONTROL).rstrip("\n").split("\n")],
+                         "comprimido")
+    except Exception:  # comprimido roto o de un formato que no es el que dice
+        return None
+    lineas = [[(f"{humano(tam):>9}  ", "hex_off"), (limpia(n), "dir" if n.endswith("/") else "txt")]
+              for tam, n in filas]
+    if total is None or total > len(filas):
+        lineas.append([("        …", "tenue")])
+    return Vista(lineas or nota("vacío"), cuenta(total) if total is not None else f"{len(filas)}+ elementos")
+
+
+def vista_fichero(ruta, st, w, h, completa=False, con_imagen=True):
+    """Lo que se enseña de un fichero: en la columna de vista previa o, con completa, en el visor."""
+    nombre = os.path.basename(ruta).lower()
+    ext = os.path.splitext(nombre)[1]
+    try:
+        if st is None or stat.S_ISLNK(st.st_mode):
+            return Vista(nota("enlace roto: no existe aquello a lo que apunta", w))
+        if not stat.S_ISREG(st.st_mode):
+            return Vista(nota((corre(["file", "-b", ruta], 2) or "fichero especial").strip(), w))
+        if st.st_size == 0:
+            return Vista(nota("fichero vacío"))
+        v = None
+        if con_imagen and ext in IMAGENES:
+            v = vista_imagen(ruta, w, h)
+        elif ext == ".pdf":
+            v = vista_pdf(ruta, completa)
+        elif nombre.endswith(ZIPS + TARS + OTROS_ARCHIVOS):
+            v = vista_archivo(ruta, nombre, completa)
+        if v:
+            return v
+        with open(ruta, "rb") as f:
+            datos = f.read(2_000_000 if completa else 48_000)
+        texto = decodifica(datos)
+        if texto is None:
+            return vista_binaria(ruta, datos, w, completa)
+        return vista_texto(texto, nombre, len(datos) < st.st_size, completa)
+    except PermissionError:
+        return Vista(nota("sin permiso de lectura", w))
+    except OSError as e:
+        return Vista(nota(e.strerror or str(e), w))
+    except Exception as e:  # una vista previa nunca debe tumbar el programa
+        return Vista(nota(f"no se puede previsualizar: {type(e).__name__}", w))
+
+
+# ── Copiar, mover, borrar ────────────────────────────────────────────────────────────────────
+
+class Cancelado(Exception):
+    pass
+
+
+def borra(ruta):
+    if os.path.isdir(ruta) and not os.path.islink(ruta):
+        shutil.rmtree(ruta)
+    else:
+        os.unlink(ruta)
+
+
+def a_la_papelera(rutas):
+    """Manda rutas a la papelera con gio. Devuelve el texto del error, o '' si todo fue bien."""
+    if not shutil.which("gio"):
+        return "no está instalado «gio»"
+    error = ""
+    for i in range(0, len(rutas), 200):
+        try:
+            r = subprocess.run(["gio", "trash", "--", *rutas[i:i + 200]], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL)
+        except OSError as e:
+            return str(e)
+        if r.returncode:
+            # gio dice «gio: file:///ruta: motivo»; interesa el motivo
+            error = (r.stderr.strip().splitlines() or ["error desconocido"])[-1].rpartition(": ")[2]
+    return error
+
+
+def nombre_libre(destino):
+    """destino si no existe; si existe, «nombre (copia).ext», «nombre (copia 2).ext»…"""
+    if not os.path.lexists(destino):
+        return destino
+    carpeta, nombre = os.path.split(destino)
+    raiz, ext = os.path.splitext(nombre)
+    n = 1
+    while True:
+        cand = os.path.join(carpeta, f"{raiz} (copia{'' if n == 1 else f' {n}'}){ext}")
+        if not os.path.lexists(cand):
+            return cand
+        n += 1
+
+
+class Tarea:
+    """Copia o mueve en un hilo aparte; la interfaz solo mira sus contadores."""
+
+    def __init__(self, pares, mover):
+        self.pares, self.mover = pares, mover  # pares: (origen, destino, pisar)
+        self.total = self.hecho = 0
+        self.actual = ""
+        self.errores, self.hechos = [], []
+        self.cancelar = self.fin = False
+
+    def error(self, ruta, e):
+        self.errores.append(f"{limpia(os.path.basename(ruta))}: {getattr(e, 'strerror', None) or e}")
+
+    def pesa(self, ruta):
+        st = os.lstat(ruta)
+        if not stat.S_ISDIR(st.st_mode):
+            return st.st_size
+        total = 0
+        for raiz, _, ficheros in os.walk(ruta):
+            if self.cancelar:
+                raise Cancelado
+            for f in ficheros:
+                try:
+                    total += os.lstat(os.path.join(raiz, f)).st_size
+                except OSError:
+                    pass
+        return total
+
+    def copia(self, origen, destino, pisar=False):
+        if self.cancelar:
+            raise Cancelado
+        st = os.lstat(origen)
+        if stat.S_ISLNK(st.st_mode):
+            if pisar and os.path.lexists(destino):
+                os.unlink(destino)
+            os.symlink(os.readlink(origen), destino)
+        elif stat.S_ISDIR(st.st_mode):
+            os.mkdir(destino)
+            with os.scandir(origen) as it:
+                nombres = [d.name for d in it]
+            for n in nombres:
+                try:
+                    self.copia(os.path.join(origen, n), os.path.join(destino, n))
+                except OSError as e:
+                    self.error(os.path.join(origen, n), e)
+            self.copia_atributos(origen, destino)
+        elif stat.S_ISREG(st.st_mode):
+            self.actual = os.path.basename(origen)
+            # "xb": si entretanto ha aparecido algo en el destino, falla en vez de pisarlo.
+            with open(origen, "rb") as f, open(destino, "wb" if pisar else "xb") as g:
+                try:
+                    while trozo := f.read(1 << 20):
+                        if self.cancelar:
+                            raise Cancelado
+                        g.write(trozo)
+                        self.hecho += len(trozo)
+                except BaseException:
+                    os.unlink(destino)  # no dejar un fichero a medias
+                    raise
+            self.copia_atributos(origen, destino)
+        else:
+            raise OSError("fichero especial, no se copia")
+
+    @staticmethod
+    def copia_atributos(origen, destino):
+        try:
+            shutil.copystat(origen, destino, follow_symlinks=False)
+        except OSError:
+            pass  # p. ej. un disco FAT que no admite permisos
+
+    def run(self):
+        try:
+            plan = []
+            for origen, destino, pisar in self.pares:
+                directo = False
+                if self.mover:
+                    try:
+                        directo = os.lstat(origen).st_dev == os.stat(os.path.dirname(destino)).st_dev
+                    except OSError:
+                        pass
+                if not directo:
+                    self.total += self.pesa(origen)
+                plan.append((origen, destino, pisar, directo))
+            for origen, destino, pisar, directo in plan:
+                if self.cancelar:
+                    break
+                self.actual = os.path.basename(origen)
+                existia = os.path.lexists(destino)
+                antes = len(self.errores)
+                try:
+                    if directo:
+                        if existia and not pisar:
+                            raise FileExistsError("ya existe en el destino")
+                        os.replace(origen, destino)
+                    else:
+                        self.copia(origen, destino, pisar)
+                        # Solo se quita el original si su copia ha salido entera.
+                        if self.mover and len(self.errores) == antes:
+                            borra(origen)
+                    self.hechos.append(destino)
+                except Cancelado:
+                    if not existia and os.path.isdir(destino) and not os.path.islink(destino):
+                        shutil.rmtree(destino, ignore_errors=True)  # copia a medias, recién creada
+                    break
+                except OSError as e:
+                    self.error(origen, e)
+        except Cancelado:
+            pass
+        finally:
+            self.fin = True
+
+
+# ── Sitios ───────────────────────────────────────────────────────────────────────────────────
+
+def sitios(favoritos=()):
+    """[(etiqueta, ruta, detalle)]: carpeta personal, favoritos propios y de Nautilus, discos montados."""
+    vistos, out = set(), []
+
+    def pon(etiqueta, ruta, detalle=""):
+        ruta = os.path.normpath(ruta)
+        if ruta not in vistos and os.path.isdir(ruta):
+            vistos.add(ruta)
+            out.append((etiqueta, ruta, detalle))
+
+    def libre(ruta):
+        try:
+            u = shutil.disk_usage(ruta)
+            return f"{humano(u.free)} libres de {humano(u.total)}"
+        except OSError:
+            return ""
+
+    pon("Carpeta personal", HOME)
+    for ruta in favoritos:
+        pon("★ " + limpia(os.path.basename(ruta) or "/"), ruta)
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+    try:
+        for lin in Path(config, "user-dirs.dirs").read_text().splitlines():
+            m = re.match(r'XDG_\w+_DIR="(.*)"', lin.strip())
+            if m:
+                ruta = m.group(1).replace("$HOME", HOME)
+                pon(os.path.basename(ruta), ruta)
+    except OSError:
+        pass
+    for marcadores in ("gtk-3.0/bookmarks", "gtk-4.0/bookmarks"):
+        try:
+            for lin in Path(config, marcadores).read_text().splitlines():
+                uri, _, etiqueta = lin.strip().partition(" ")
+                if uri.startswith("file://"):
+                    ruta = urllib.parse.unquote(uri[7:])
+                    pon(etiqueta or os.path.basename(ruta), ruta)
+        except OSError:
+            pass
+    pon("Papelera", os.path.join(HOME, ".local/share/Trash/files"))
+    pon("Raíz", "/", libre("/"))
+    try:
+        for lin in Path("/proc/mounts").read_text().splitlines():
+            disp, punto, tipo = lin.split()[:3]
+            punto = punto.encode().decode("unicode_escape").encode("latin-1").decode("utf-8", "replace")
+            en_red = tipo in FS_RED
+            disco = disp.startswith("/dev/") and not disp.startswith("/dev/loop")
+            if punto.startswith(("/boot", "/snap", "/var/snap", "/run/snapd", "/sys", "/proc")):
+                continue
+            if en_red or disco:
+                # A un disco de red no se le pregunta el espacio: si no responde, cuelga.
+                pon(os.path.basename(punto) or "/", punto, "red" if en_red else libre(punto))
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+# ── Interfaz ─────────────────────────────────────────────────────────────────────────────────
+
+TECLAS_F = ("Ayuda", "Renom", "Ver", "Editar", "Copiar", "Mover", "MkDir", "Borrar", "Sitios", "Salir")
+BOTON5 = getattr(curses, "BUTTON5_PRESSED", 0x200000)
+ATRAS = curses.KEY_BACKSPACE
+
+
+class App:
+    def __init__(self, scr, ruta, sel, tema):
+        self.scr = scr
+        self.cwd = ruta
+        self.anterior = ruta
+        self.sel = {}       # carpeta → nombre bajo el cursor
+        self.pos = {}       # carpeta → índice del cursor, por si el nombre desaparece
+        self.top = {}       # carpeta → primera fila visible
+        self.marcas = set()  # nombres marcados en la carpeta actual
+        self.filtro, self.filtrando, self._filt = "", False, (None, None, [])
+        self.porta = ([], False)  # portapapeles: rutas y si es para mover
+        self.aviso = ""
+        self.cache = {}
+        self.vistas = OrderedDict()
+        self.cols, self.zonas_f, self.pendiente = [], [], None
+        self.clic = (0, -1, -1)
+        self.libre_cache = (None, 0, "")
+        self.salir = False
+        self.final = None
+        self.H, self.W, self.alto = 0, 0, 0
+        self.fondo = self.dibuja  # lo que se pinta debajo de un diálogo
+
+        estado = self.lee_estado()
+        self.ocultos = bool(estado.get("ocultos", False))
+        self.orden = estado.get("orden") if estado.get("orden") in ORDENES else "nombre"
+        self.tema_nombre = tema or (estado.get("tema") if estado.get("tema") in TEMAS else "dos")
+        favoritos = estado.get("favoritos")
+        self.favoritos = [f for f in favoritos if isinstance(f, str)] if isinstance(favoritos, list) else []
+        if sel:
+            self.sel[ruta] = sel
+            self.ocultos = self.ocultos or sel.startswith(".")
+
+        curses.set_escdelay(25)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        # Sin intervalo y sin pedir «clics»: si se deja a ncurses componerlos, entrega los eventos
+        # con uno de retraso. El doble clic se detecta aquí (lee_raton).
+        curses.mouseinterval(0)
+        curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED | curses.BUTTON4_PRESSED | BOTON5)
+        self.colores = curses.has_colors()
+        self.img_ok = self.colores and curses.COLORS >= 256 and curses.COLOR_PAIRS >= 256
+        self._pares, self._at, self._pimg, self._img = {}, {}, {}, None
+        self.pon_tema(self.tema_nombre)
+
+    # ── Estado guardado ──
+
+    @staticmethod
+    def lee_estado():
+        try:
+            estado = json.loads(ESTADO.read_text())
+        except (OSError, ValueError):
+            return {}
+        return estado if isinstance(estado, dict) else {}
+
+    def guarda_estado(self):
+        try:
+            ESTADO.parent.mkdir(parents=True, exist_ok=True)
+            ESTADO.write_text(json.dumps({"tema": self.tema_nombre, "ocultos": self.ocultos,
+                                          "orden": self.orden, "favoritos": self.favoritos},
+                                         ensure_ascii=False, indent=1))
+        except OSError:
+            pass
+
+    # ── Colores ──
+
+    def pon_tema(self, nombre):
+        self.tema_nombre, self.tema = nombre, TEMAS[nombre]
+        self._pares.clear()
+        self._at.clear()
+        self._pimg.clear()
+        self._img = None
+        self.scr.bkgd(" ", self.at("base"))
+
+    @staticmethod
+    def color(i):
+        """Índice de la paleta de 256 llevado a lo que tenga la terminal."""
+        if curses.COLORS >= 256:
+            return i
+        if i >= 232:
+            r = g = b = 8 + 10 * (i - 232)
+        else:
+            i -= 16
+            r, g, b = ((0, 95, 135, 175, 215, 255)[v] for v in (i // 36, i // 6 % 6, i % 6))
+        c = (r > 110) | (g > 110) << 1 | (b > 110) << 2
+        return c + 8 if curses.COLORS >= 16 and max(r, g, b) > 200 else c
+
+    def at(self, papel):
+        a = self._at.get(papel)
+        if a is None and not self.colores:
+            # Terminal sin color: lo que lleva fondo propio va en vídeo inverso.
+            inverso = papel in ("cursor", "cursor_marc", "camino", "barra", "ftxt", "dlg", "dlg_tenue", "dlg_err")
+            a = self._at[papel] = curses.A_REVERSE if inverso else \
+                curses.A_BOLD if len(self.tema[papel]) > 2 else 0
+        if a is None:
+            tinta, fondo, *extra = self.tema[papel]
+            n = self._pares.get((tinta, fondo))
+            if n is None:
+                n = len(self._pares) + 1
+                if n < ZONA_IMG:
+                    curses.init_pair(n, self.color(tinta), self.color(fondo))
+                    self._pares[tinta, fondo] = n
+                else:
+                    n = 0
+            a = self._at[papel] = curses.color_pair(n) | (extra[0] if extra else 0)
+        return a
+
+    def at_img(self, tinta, fondo):
+        n = self._pimg.get((tinta, fondo))
+        if n is None:
+            n = ZONA_IMG + len(self._pimg)
+            if n > 255:
+                return self.at("txt")
+            curses.init_pair(n, tinta, self.tema["base"][1] if fondo < 0 else fondo)
+            self._pimg[tinta, fondo] = n
+        return curses.color_pair(n)
+
+    # ── Pintar ──
+
+    def pon(self, y, x, s, at=0, w=None):
+        """Escribe s en (y, x) recortado a w columnas y a la pantalla. Nunca lanza."""
+        if not (0 <= y < self.H and 0 <= x < self.W):
+            return
+        lim = self.W - x if w is None else min(w, self.W - x)
+        if ancho(s) > lim:
+            s = recorta(s, lim, "")
+        try:
+            self.scr.addstr(y, x, s, at)
+        except (curses.error, ValueError, UnicodeError):
+            pass  # la última celda de la pantalla siempre protesta
+
+    def pinta_lineas(self, x, y, w, alto, vista, desde=0, dx=0, marca=-1):
+        if self._img is not vista and any(type(p) is tuple for lin in vista.lineas[:2] for _, p in lin):
+            self._pimg.clear()  # otra imagen: sus pares de color sustituyen a los de la anterior
+            self._img = vista
+        lineas = vista.lineas
+        for f in range(min(alto, len(lineas) - desde)):
+            cx, resto, salta = x, w, dx
+            for txt, papel in lineas[desde + f]:
+                if salta:
+                    if len(txt) <= salta:
+                        salta -= len(txt)
+                        continue
+                    txt, salta = txt[salta:], 0
+                if resto <= 0:
+                    break
+                a = ancho(txt)
+                if a > resto:
+                    txt = recorta(txt, resto, "")
+                    a = ancho(txt)
+                at = self.at("camino") if desde + f == marca else \
+                    self.at(papel) if type(papel) is str else self.at_img(*papel)
+                self.pon(y + f, cx, txt, at)
+                cx += a
+                resto -= a
+
+    def papel_de(self, e):
+        if e.nombre.startswith("."):
+            return "oculto"
+        if e.es_dir:
+            return "dir"
+        if e.roto:
+            return "roto"
+        if e.es_link:
+            return "link"
+        return "exe" if e.exe else "fich"
+
+    def pinta_lista(self, x, w, ents, i_sel, top, modo, error=None):
+        if error or not ents:
+            self.pon(3 if self.alto > 1 else 2, x + 1, recorta(f"({error or 'vacía'})", w - 2), self.at("tenue"))
+            return
+        con_tam = modo == "activa" and w >= 31
+        for f in range(min(self.alto, len(ents) - top)):
+            e = ents[top + f]
+            marcada = modo == "activa" and e.nombre in self.marcas
+            dcha = "▸" if e.es_dir else humano(e.tam) if con_tam and e.st else ""
+            hueco = w - 2 - (ancho(dcha) + 1 if dcha else 0)
+            txt = ("√" if marcada else " ") + ajusta(recorta_nombre(e.visible, hueco), hueco) \
+                + (" " + dcha if dcha else "") + " "
+            if top + f == i_sel:
+                papel = "camino" if modo != "activa" else "cursor_marc" if marcada else "cursor"
+            else:
+                papel = "marcado" if marcada else self.papel_de(e)
+            self.pon(2 + f, x, txt, self.at(papel), w)
+
+    def reparto(self):
+        """Carpetas que se enseñan y anchos: columnas antepasadas, activa y vista previa."""
+        interior = self.W - 2
+        resto = interior - max(20, interior * 36 // 100)
+        cadena = [self.cwd]
+        while (padre := os.path.dirname(cadena[0])) != cadena[0]:
+            cadena.insert(0, padre)
+        n = max(0, min(3, (resto - 30) // 20, len(cadena) - 1))
+        util = resto - (n + 1)
+        w_ant = min(22, (util - 30) // n) if n else 0
+        w_act = min(44, util - n * w_ant)
+        return cadena[-(n + 1):], w_ant, w_act, interior - (n + 1) - n * w_ant - w_act
+
+    def dibuja(self, final=True):
+        """Pinta la pantalla principal. final=False: sirve de fondo a un diálogo, que es quien refresca."""
+        scr = self.scr
+        self.H, self.W = H, W = scr.getmaxyx()
+        scr.erase()
+        self.cols, self.zonas_f, self.pendiente = [], [], None
+        if H < 10 or W < 48:
+            self.alto = 1
+            self.pon(0, 0, recorta("Agranda la ventana (mínimo 48×10)", W), self.at("base"))
+            if final:
+                scr.refresh()
+            return
+        alto = self.alto = H - 5
+        dirs, w_ant, w_act, w_vis = self.reparto()
+        borde = self.at("borde")
+        self.barra_titulo()
+        self.pon(1, 0, "╔" + "═" * (W - 2) + "╗", borde)
+        self.pon(H - 3, 0, "╚" + "═" * (W - 2) + "╝", borde)
+        for y in range(2, 2 + alto):
+            self.pon(y, 0, "║", borde)
+            self.pon(y, W - 1, "║", borde)
+
+        x = 1
+        for k, d in enumerate(dirs):
+            activa = k == len(dirs) - 1
+            w = w_act if activa else w_ant
+            ents, error = self.ents(d)
+            if activa:
+                i = self.indice(d, ents)
+            else:
+                i = self.cache[d].indice.get(os.path.basename(dirs[k + 1]), -1)
+            top = self.ajusta_top(d, i, len(ents))
+            self.cabecera(x, w, os.path.basename(d) or "/", activa)
+            self.pinta_lista(x, w, ents, i, top, "activa" if activa else "camino", error)
+            self.separador(x + w, len(ents), top)
+            self.cols.append((x, w, "activa" if activa else "camino", d, ents, top))
+            if activa:
+                pie = f" {i + 1}/{len(ents)} " if ents else ""
+                if self.filtro:
+                    pie = f" /{self.filtro}" + (pie or " ")
+                self.pon(H - 3, x + max(0, w - ancho(pie) - 1), recorta(pie, w - 1), borde)
+            x += w + 1
+
+        e, info = self.actual(), ""
+        if e is not None and e.es_dir:
+            self.cabecera(x, w_vis, e.visible, False)
+            if e.ruta in self.cache:
+                lst = self.listado(e.ruta)
+                self.pinta_lista(x, w_vis, lst.entradas, -1, 0, "vista", lst.error)
+                self.cols.append((x, w_vis, "vista", e.ruta, lst.entradas, 0))
+                info = "" if lst.error else cuenta(len(lst.entradas))
+            else:
+                self.pendiente = ("dir", e.ruta)
+        elif e is not None:
+            self.cabecera(x, w_vis, e.visible, False)
+            clave = (e.ruta, e.st.st_mtime_ns if e.st else 0, e.tam, w_vis, alto)
+            v = self.vistas.get(clave)
+            if v is None:
+                self.pendiente = ("fichero", e, clave, w_vis - 1, alto)
+            else:
+                self.pinta_lineas(x + 1, 2, w_vis - 1, alto, v)
+                info = v.info
+        if self.pendiente:
+            self.pon(3, x + 1, "…", self.at("tenue"))
+        if info:
+            info = recorta(f" {info} ", w_vis - 2)
+            self.pon(H - 3, x + w_vis - ancho(info) - 1, info, borde)
+
+        self.linea_estado()
+        self.barra_teclas()
+        if final:
+            scr.refresh()
+        elif final is False and self.pendiente:
+            # Debajo de un diálogo no hay bucle que espere: la vista previa se calcula ya.
+            self.resuelve(self.pendiente)
+            self.dibuja(final=None)
+
+    def cabecera(self, x, w, texto, activa):
+        self.pon(1, x + 1, f" {recorta_nombre(texto, w - 4)} ", self.at("cab_act" if activa else "cab"))
+
+    def separador(self, x, n, top):
+        """Línea entre columnas; hace de barra de desplazamiento si la lista no cabe."""
+        alto, borde = self.alto, self.at("borde")
+        self.pon(1, x, "╤", borde)
+        self.pon(self.H - 3, x, "╧", borde)
+        d0 = d1 = -1
+        if n > alto:
+            largo = max(1, alto * alto // n)
+            d0 = top * (alto - largo) // (n - alto)
+            d1 = d0 + largo
+        for f in range(alto):
+            self.pon(2 + f, x, "█" if d0 <= f < d1 else "│", borde)
+
+    def barra_titulo(self):
+        W, at = self.W, self.at("barra")
+        self.pon(0, 0, " " * W, at)
+        marca = " CASCADA "
+        self.pon(0, 0, marca, self.at("barra_res"))
+        dcha = f"{self.libre()}{time.strftime('%H:%M')} "
+        self.pon(0, W - ancho(dcha), dcha, at)
+        hueco = W - len(marca) - ancho(dcha) - 2
+        ruta = limpia(abrevia(self.cwd))
+        if ancho(ruta) > hueco:
+            ruta = "…" + ruta[-max(1, hueco - 1):]
+        self.pon(0, len(marca) + 1, ruta, at, hueco)
+
+    def libre(self):
+        ruta, cuando, txt = self.libre_cache
+        if ruta != self.cwd or time.monotonic() - cuando > 5:
+            try:
+                txt = f"{humano(shutil.disk_usage(self.cwd).free)} libres │ "
+            except OSError:
+                txt = ""
+            self.libre_cache = (self.cwd, time.monotonic(), txt)
+        return txt
+
+    def linea_estado(self):
+        y, W = self.H - 2, self.W
+        partes = []
+        if self.marcas:
+            partes.append("√ " + cuenta(len(self.marcas), "marcado", "marcados"))
+        if self.porta[0]:
+            partes.append(f"{len(self.porta[0])} para {'mover' if self.porta[1] else 'copiar'}: p pega")
+        if self.orden != "nombre":
+            partes.append(f"por {self.orden}")
+        if self.ocultos:
+            partes.append("ocultos")
+        dcha = " · ".join(partes) + " " if partes else ""
+        papel = "marcado"
+        if self.filtrando:
+            izq = f" Filtro: {self.filtro}█"
+        elif self.aviso:
+            izq = " " + self.aviso
+        else:
+            papel, e = "estado", self.actual()
+            if e is None:
+                izq = ""
+            elif e.st:
+                izq = f" {stat.filemode(e.st.st_mode)}  {dueno(e.st.st_uid)}  {humano(e.tam)}  " \
+                      f"{fecha(e.mtime)}  {e.visible}"
+            else:
+                izq = " " + e.visible
+            if e is not None and e.es_link:
+                try:
+                    izq += " → " + limpia(os.readlink(e.ruta))
+                except OSError:
+                    pass
+        self.pon(y, W - ancho(dcha), dcha, self.at("tenue"))
+        self.pon(y, 0, recorta(izq, W - ancho(dcha) - 1), self.at(papel))
+
+    def barra_teclas(self):
+        y, W = self.H - 1, self.W
+        paso = W // len(TECLAS_F)
+        self.pon(y, 0, " " * W, self.at("ftxt"))
+        for i, txt in enumerate(TECLAS_F):
+            x, num = i * paso, str(i + 1)
+            self.pon(y, x, num, self.at("fnum"))
+            self.pon(y, x + len(num), recorta(txt, paso - len(num) - 1, ""), self.at("ftxt"))
+            self.zonas_f.append((x, x + paso, curses.KEY_F0 + i + 1))
+
+    # ── Carpetas y cursor ──
+
+    def listado(self, d):
+        lst = self.cache.get(d)
+        if lst is not None:
+            try:
+                m = os.stat(d).st_mtime_ns
+            except OSError:
+                m = None
+            if m == lst.mtime:
+                return lst
+        if len(self.cache) > 300:
+            self.cache.clear()
+        lst = self.cache[d] = Listado(d, self.ocultos, self.orden)
+        return lst
+
+    def ents(self, d):
+        """(entradas, error) de una carpeta; en la actual, pasadas por el filtro."""
+        lst = self.listado(d)
+        if d == self.cwd and self.filtro:
+            if self._filt[0] is not lst or self._filt[1] != self.filtro:
+                f = sin_acentos(self.filtro.casefold())
+                self._filt = (lst, self.filtro, [e for e in lst.entradas if f in e.clave])
+            return self._filt[2], lst.error
+        return lst.entradas, lst.error
+
+    def indice(self, d, ents):
+        if not ents:
+            return -1
+        nombre = self.sel.get(d)
+        if nombre is not None:
+            lst = self.cache[d]
+            if ents is lst.entradas:
+                i = lst.indice.get(nombre)
+            else:
+                i = next((k for k, e in enumerate(ents) if e.nombre == nombre), None)
+            if i is not None:
+                self.pos[d] = i
+                return i
+        i = self.pos[d] = min(self.pos.get(d, 0), len(ents) - 1)
+        self.sel[d] = ents[i].nombre
+        return i
+
+    def ajusta_top(self, d, i, n):
+        alto, top = self.alto, self.top.get(d, 0)
+        if i >= 0:
+            margen = min(2, (alto - 1) // 2)
+            if i < top + margen:
+                top = i - margen
+            elif i >= top + alto - margen:
+                top = i - alto + 1 + margen
+        top = self.top[d] = max(0, min(top, n - alto))
+        return top
+
+    def actual(self):
+        ents, _ = self.ents(self.cwd)
+        i = self.indice(self.cwd, ents)
+        return ents[i] if i >= 0 else None
+
+    def mueve(self, delta=0, a=None):
+        ents, _ = self.ents(self.cwd)
+        if ents:
+            i = self.indice(self.cwd, ents) + delta if a is None else a
+            i = max(0, min(i, len(ents) - 1))
+            self.sel[self.cwd], self.pos[self.cwd] = ents[i].nombre, i
+
+    def cambia(self, d, sel=None):
+        if d != self.cwd:
+            self.anterior, self.cwd = self.cwd, d
+            self.marcas.clear()
+            self.filtro, self.filtrando = "", False
+        if sel:
+            self.sel[d] = sel
+
+    def sube(self):
+        padre = os.path.dirname(self.cwd)
+        if padre != self.cwd:
+            self.cambia(padre, os.path.basename(self.cwd))
+
+    def entra(self, abrir):
+        e = self.actual()
+        if e is None:
+            return
+        if e.es_dir:
+            self.cambia(e.ruta)
+        elif abrir:
+            try:
+                subprocess.Popen(["xdg-open", e.ruta], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+                self.aviso = f"Abriendo {e.visible}…"
+            except OSError as err:
+                self.error("Abrir", [f"No se puede abrir: {err.strerror or err}"])
+
+    def seleccion(self):
+        """Rutas sobre las que actúan las operaciones: lo marcado o, si no, el cursor."""
+        ents, _ = self.ents(self.cwd)
+        if self.marcas:
+            return [e.ruta for e in ents if e.nombre in self.marcas]
+        e = self.actual()
+        return [e.ruta] if e else []
+
+    def tras_cambio(self, sel=None):
+        self.cache.clear()
+        self.vistas.clear()
+        self.marcas.clear()
+        if sel:
+            self.sel[self.cwd] = sel
+
+    # ── Teclado y ratón ──
+
+    def tecla(self):
+        """Una tecla: str si es un carácter, int si es especial, None si no llega ninguna."""
+        try:
+            t = self.scr.get_wch()
+        except curses.error:
+            return None
+        if t in ("\r", curses.KEY_ENTER):
+            return "\n"
+        if t in ("\x7f", "\x08"):
+            return ATRAS
+        return t
+
+    def bucle(self):
+        while not self.salir:
+            self.dibuja()
+            pendiente = self.pendiente
+            # La vista previa se calcula cuando el cursor se queda quieto, no a cada tecla.
+            self.scr.timeout(40 if pendiente else 2000)
+            t = self.tecla()
+            if t is None:
+                if pendiente:
+                    self.resuelve(pendiente)
+                continue
+            self.aviso = ""
+            self.despacha(t)
+        return self.final
+
+    def resuelve(self, p):
+        if p[0] == "dir":
+            self.listado(p[1])
+            return
+        _, e, clave, w, h = p
+        self.vistas[clave] = vista_fichero(e.ruta, e.st, w, h, con_imagen=self.img_ok)
+        while len(self.vistas) > 40:
+            self.vistas.popitem(last=False)
+
+    def despacha(self, t):
+        K = curses
+        if self.filtrando and self.tecla_filtro(t):
+            return
+        if t in (K.KEY_UP, "k"):
+            self.mueve(-1)
+        elif t in (K.KEY_DOWN, "j"):
+            self.mueve(1)
+        elif t == K.KEY_PPAGE:
+            self.mueve(-(self.alto - 1))
+        elif t == K.KEY_NPAGE:
+            self.mueve(self.alto - 1)
+        elif t == K.KEY_HOME:
+            self.mueve(a=0)
+        elif t == K.KEY_END:
+            self.mueve(a=1 << 30)
+        elif t in (K.KEY_LEFT, "h", ATRAS):
+            self.sube()
+        elif t in (K.KEY_RIGHT, "l"):
+            self.entra(abrir=False)
+        elif t == "\n":
+            self.entra(abrir=True)
+        elif t == K.KEY_MOUSE:
+            self.raton()
+        elif t == " ":
+            e = self.actual()
+            if e:
+                self.marcas ^= {e.nombre}
+                self.mueve(1)
+        elif t == "a":
+            self.marcas = {e.nombre for e in self.ents(self.cwd)[0]}
+        elif t == "*":
+            self.marcas = {e.nombre for e in self.ents(self.cwd)[0]} - self.marcas
+        elif t == "\x1b":
+            if self.filtro:
+                self.filtro = ""
+            elif self.marcas:
+                self.marcas.clear()
+            else:
+                self.porta = ([], False)
+        elif t == "/":
+            self.filtrando = True
+        elif t == ".":
+            self.ocultos = not self.ocultos
+            self.cache.clear()
+            self.guarda_estado()
+        elif t == "s":
+            self.orden = ORDENES[(ORDENES.index(self.orden) + 1) % len(ORDENES)]
+            self.cache.clear()
+            self.guarda_estado()
+            self.aviso = f"Orden: por {self.orden}"
+        elif t == "T":
+            nombres = list(TEMAS)
+            self.pon_tema(nombres[(nombres.index(self.tema_nombre) + 1) % len(nombres)])
+            self.guarda_estado()
+            self.aviso = f"Tema: {self.tema_nombre}"
+        elif t in ("R", "\x0c"):  # Ctrl+L, además, repinta la pantalla entera
+            self.cache.clear()
+            self.vistas.clear()
+            self.scr.clear()
+        elif t == "~":
+            self.cambia(HOME)
+        elif t == "-":
+            self.cambia(self.anterior)
+        elif t == "g":
+            self.ir_a()
+        elif t in (K.KEY_F9, "u"):
+            self.elige_lugar()
+        elif t == "b":
+            self.favorito()
+        elif t in (K.KEY_F1, "?"):
+            self.visor("Ayuda", Vista([[(lin, "txt")] for lin in AYUDA.split("\n")]))
+        elif t in (K.KEY_F2, "r"):
+            self.renombra()
+        elif t in (K.KEY_F3, "v"):
+            self.ver()
+        elif t in (K.KEY_F4, "e"):
+            self.edita()
+        elif t == K.KEY_F5:
+            self.copia_a(mover=False)
+        elif t == K.KEY_F6:
+            self.copia_a(mover=True)
+        elif t in ("c", "x"):
+            rutas = self.seleccion()
+            if rutas:
+                self.porta = (rutas, t == "x")
+                self.marcas.clear()
+                self.aviso = f"{self.cuantos(rutas)} para {'mover' if t == 'x' else 'copiar'}: " \
+                             "ve a la carpeta de destino y pulsa p"
+        elif t == "p":
+            self.pega()
+        elif t in (K.KEY_F7, "n"):
+            self.carpeta_nueva()
+        elif t in (K.KEY_F8, K.KEY_DC, "d"):
+            self.borrar()
+        elif t == K.KEY_SDC:
+            self.borrar(definitivo=True)
+        elif t in ("S", "!"):
+            self.shell()
+        elif t in (K.KEY_F10, "q"):
+            self.salir, self.final = True, self.cwd
+        elif t == "Q":
+            self.salir = True
+
+    def tecla_filtro(self, t):
+        """Teclas mientras se escribe el filtro. False: la tecla no era del filtro."""
+        if isinstance(t, str) and t.isprintable():
+            self.filtro += t
+        elif t == ATRAS:
+            if self.filtro:
+                self.filtro = self.filtro[:-1]
+            else:
+                self.filtrando = False
+        elif t == "\n":
+            self.filtrando = False
+            return True
+        elif t == "\x1b":
+            self.filtro, self.filtrando = "", False
+            return True
+        else:
+            self.filtrando = t in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE,
+                                   curses.KEY_RESIZE, curses.KEY_MOUSE)
+            return False
+        ents = self._filt[2] if self.ents(self.cwd)[0] is self._filt[2] else []
+        if not any(e.nombre == self.sel.get(self.cwd) for e in ents):
+            self.pos[self.cwd] = 0
+            self.sel.pop(self.cwd, None)
+        return True
+
+    def lee_raton(self):
+        """Eventos de ratón pendientes, en orden: [(x, y, clic, rueda)].
+
+        clic: 1 sencillo, 2 doble; rueda: -1 sube, 1 baja. Si llegan varios eventos juntos, ncurses
+        los entrega con una sola tecla y del último al primero: se vacía la cola y se le da la vuelta.
+        """
+        crudos = []
+        while len(crudos) < 32:
+            try:
+                _, x, y, _, b = curses.getmouse()
+            except curses.error:
+                break
+            crudos.append((x, y, b))
+        eventos = []
+        for x, y, b in reversed(crudos):
+            if b & curses.BUTTON4_PRESSED:
+                eventos.append((x, y, 0, -1))
+            elif b & BOTON5:
+                eventos.append((x, y, 0, 1))
+            elif b & curses.BUTTON1_PRESSED:
+                ahora = time.monotonic()
+                doble = ahora - self.clic[0] < 0.4 and self.clic[1:] == (x, y)
+                self.clic = (0 if doble else ahora, x, y)
+                eventos.append((x, y, 2 if doble else 1, 0))
+        return eventos
+
+    def raton(self):
+        for x, y, clic, rueda in self.lee_raton():
+            if rueda:
+                self.mueve(3 * rueda)
+            elif y == self.H - 1:
+                for x0, x1, tecla in self.zonas_f:
+                    if x0 <= x < x1:
+                        return self.despacha(tecla)
+            elif 2 <= y < 2 + self.alto:
+                self.clic_en_columna(x, y, clic)
+                self.dibuja(final=False)  # por si el siguiente evento cae ya en otra disposición
+
+    def clic_en_columna(self, x, y, clic):
+        for x0, w, modo, d, ents, top in self.cols:
+            if not x0 <= x < x0 + w:
+                continue
+            i = top + y - 2
+            if i >= len(ents):
+                if modo != "activa":
+                    self.cambia(d)
+            elif modo == "activa":
+                ya = self.sel.get(d) == ents[i].nombre
+                self.sel[d] = ents[i].nombre
+                if clic == 2 and ya:
+                    self.entra(abrir=True)
+            else:
+                self.cambia(d, ents[i].nombre)
+            return
+
+    # ── Diálogos ──
+
+    def caja(self, titulo, w, h, papel="dlg"):
+        """Caja centrada con sombra. Devuelve (y, x, w, h) ya ajustados a la pantalla."""
+        w, h = max(10, min(w, self.W - 4)), max(3, min(h, self.H - 2))
+        y, x = max(0, (self.H - h) // 2 - 1), (self.W - w) // 2
+        at = self.at(papel)
+        for i in range(1, h + 1):
+            self.pon(y + i, x + 2, " " * w, self.at("sombra"))
+        self.pon(y, x, "╔" + "═" * (w - 2) + "╗", at)
+        for i in range(1, h - 1):
+            self.pon(y + i, x, "║" + " " * (w - 2) + "║", at)
+        self.pon(y + h - 1, x, "╚" + "═" * (w - 2) + "╝", at)
+        titulo = recorta(f" {titulo} ", w - 4)
+        self.pon(y, x + (w - ancho(titulo)) // 2, titulo, at)
+        return y, x, w, h
+
+    def confirmar(self, titulo, lineas, botones=("Sí", "No"), defecto=0, papel="dlg"):
+        """Diálogo con botones. Devuelve el índice del pulsado, o -1 con Esc."""
+        sel, n = defecto, len(botones)
+        while True:
+            self.fondo(final=False)
+            bw = sum(ancho(b) + 4 for b in botones) + 2 * (n - 1)
+            w = min(self.W - 4, max(bw + 6, max(map(ancho, lineas), default=0) + 6, ancho(titulo) + 8, 34))
+            visibles = lineas[:max(1, self.H - 8)]
+            y, x, w, h = self.caja(titulo, w, len(visibles) + 5, papel)
+            for i, lin in enumerate(visibles):
+                self.pon(y + 2 + i, x + 3, recorta(lin, w - 6), self.at(papel))
+            bx, zonas = x + (w - bw) // 2, []
+            for i, b in enumerate(botones):
+                txt = f"[ {b} ]"
+                self.pon(y + h - 2, bx, txt, self.at("dlg_btn_sel" if i == sel else papel))
+                zonas.append((bx, bx + ancho(txt), i))
+                bx += ancho(txt) + 2
+            self.scr.refresh()
+            self.scr.timeout(-1)
+            t = self.tecla()
+            if t in (curses.KEY_LEFT, curses.KEY_BTAB, curses.KEY_UP):
+                sel = (sel - 1) % n
+            elif t in (curses.KEY_RIGHT, "\t", curses.KEY_DOWN):
+                sel = (sel + 1) % n
+            elif t == "\n":
+                return sel
+            elif t == "\x1b":
+                return -1
+            elif t == curses.KEY_MOUSE:
+                for mx, my, clic, _ in self.lee_raton():
+                    for x0, x1, i in zonas:
+                        if clic and my == y + h - 2 and x0 <= mx < x1:
+                            return i
+            elif isinstance(t, str):
+                iguales = [i for i, b in enumerate(botones) if sin_acentos(b[0].casefold()) == t.casefold()]
+                if len(iguales) == 1:
+                    return iguales[0]
+
+    def error(self, titulo, lineas):
+        self.confirmar(titulo, lineas, ("Aceptar",), papel="dlg_err")
+
+    def completa(self, texto):
+        """Tab en un campo de ruta: (texto completado, candidatos)."""
+        base = os.path.expanduser(texto)
+        if not os.path.isabs(base):
+            base = os.path.join(self.cwd, base)
+        carpeta, prefijo = os.path.split(base)
+        if not texto.endswith(prefijo):
+            return texto, []
+        try:
+            nombres = sorted(n for n in os.listdir(carpeta)
+                             if n.startswith(prefijo) and (prefijo.startswith(".") or not n.startswith(".")))
+        except OSError:
+            return texto, []
+        if not nombres:
+            return texto, []
+        comun = os.path.commonprefix(nombres)
+        nuevo = texto[:len(texto) - len(prefijo)] + comun
+        if len(nombres) == 1 and os.path.isdir(os.path.join(carpeta, comun)):
+            nuevo += "/"
+        return nuevo, nombres
+
+    def pedir(self, titulo, etiqueta, inicial="", cursor=None, rutas=False):
+        """Pide una línea de texto. Devuelve None si se cancela."""
+        buf, pos, pista = inicial, len(inicial) if cursor is None else cursor, ""
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            while True:
+                self.fondo(final=False)
+                y, x, w, _ = self.caja(titulo, max(56, ancho(etiqueta) + 6), 7)
+                cw = w - 4
+                self.pon(y + 1, x + 2, recorta(etiqueta, cw), self.at("dlg"))
+                desde = max(0, pos - cw + 1)
+                self.pon(y + 3, x + 2, ajusta(recorta(buf[desde:], cw, ""), cw), self.at("dlg_campo"))
+                ayuda = "Intro acepta · Esc cancela" + (" · Tab completa" if rutas else "")
+                self.pon(y + 5, x + 2, recorta(pista or ayuda, cw), self.at("dlg_tenue"))
+                try:
+                    self.scr.move(y + 3, x + 2 + min(cw - 1, ancho(buf[desde:pos])))
+                except curses.error:
+                    pass
+                self.scr.refresh()
+                self.scr.timeout(-1)
+                t = self.tecla()
+                pista = ""
+                if t == "\n":
+                    return buf
+                if t == "\x1b":
+                    return None
+                if t == curses.KEY_LEFT:
+                    pos = max(0, pos - 1)
+                elif t == curses.KEY_RIGHT:
+                    pos = min(len(buf), pos + 1)
+                elif t in (curses.KEY_HOME, "\x01"):
+                    pos = 0
+                elif t in (curses.KEY_END, "\x05"):
+                    pos = len(buf)
+                elif t == ATRAS:
+                    if pos:
+                        buf, pos = buf[:pos - 1] + buf[pos:], pos - 1
+                elif t == curses.KEY_DC:
+                    buf = buf[:pos] + buf[pos + 1:]
+                elif t == "\x15":  # Ctrl+U
+                    buf, pos = buf[pos:], 0
+                elif t == "\x0b":  # Ctrl+K
+                    buf = buf[:pos]
+                elif t == "\t" and rutas:
+                    buf, candidatos = self.completa(buf[:pos] + buf[pos:])
+                    pos = len(buf)
+                    if len(candidatos) > 1:
+                        pista = "  ".join(limpia(c) for c in candidatos[:30])
+                    elif not candidatos:
+                        pista = "(nada que empiece así)"
+                elif t == curses.KEY_MOUSE:
+                    self.lee_raton()
+                elif isinstance(t, str) and t.isprintable():
+                    buf, pos = buf[:pos] + t + buf[pos:], pos + 1
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
+    def menu(self, titulo, items, sel=0):
+        """Lista para elegir. Devuelve el índice, o -1 con Esc."""
+        top = 0
+        while True:
+            self.fondo(final=False)
+            alto = max(1, min(len(items), self.H - 6))
+            w = max(max(map(ancho, items)) + 6, ancho(titulo) + 8, 30)
+            y, x, w, _ = self.caja(titulo, w, alto + 2)
+            top = max(0, min(max(top, sel - alto + 1), sel, len(items) - alto))
+            for f in range(alto):
+                i = top + f
+                self.pon(y + 1 + f, x + 1, ajusta(" " + recorta(items[i], w - 4), w - 2),
+                         self.at("dlg_btn_sel" if i == sel else "dlg"))
+            self.scr.refresh()
+            self.scr.timeout(-1)
+            t = self.tecla()
+            if t in (curses.KEY_UP, "k"):
+                sel = max(0, sel - 1)
+            elif t in (curses.KEY_DOWN, "j"):
+                sel = min(len(items) - 1, sel + 1)
+            elif t == curses.KEY_PPAGE:
+                sel = max(0, sel - alto)
+            elif t == curses.KEY_NPAGE:
+                sel = min(len(items) - 1, sel + alto)
+            elif t == curses.KEY_HOME:
+                sel = 0
+            elif t == curses.KEY_END:
+                sel = len(items) - 1
+            elif t in ("\n", curses.KEY_RIGHT):
+                return sel
+            elif t in ("\x1b", "q", curses.KEY_LEFT, curses.KEY_F9, curses.KEY_F10):
+                return -1
+            elif t == curses.KEY_MOUSE:
+                for mx, my, clic, rueda in self.lee_raton():
+                    if rueda:
+                        sel = max(0, min(len(items) - 1, sel + rueda))
+                    elif x < mx < x + w - 1 and 0 <= my - y - 1 < alto:
+                        return top + my - y - 1
+                    else:
+                        return -1  # clic fuera de la lista: cerrar
+
+    def progreso(self, tarea, titulo):
+        hilo = threading.Thread(target=tarea.run, daemon=True)
+        hilo.start()
+        hilo.join(0.2)  # lo inmediato no llega a enseñar el diálogo
+        self.scr.timeout(100)
+        while not tarea.fin:
+            self.fondo(final=False)
+            y, x, w, _ = self.caja(titulo, 64, 8)
+            dlg, cw = self.at("dlg"), w - 6
+            self.pon(y + 2, x + 3, recorta_nombre(limpia(tarea.actual), cw), dlg)
+            if tarea.total:
+                hecho = min(tarea.hecho, tarea.total)
+                n = hecho * cw // tarea.total
+                self.pon(y + 3, x + 3, "█" * n + "░" * (cw - n), dlg)
+                self.pon(y + 4, x + 3, f"{humano(hecho)} de {humano(tarea.total)}", dlg)
+            else:
+                self.pon(y + 3, x + 3, "Calculando…", dlg)
+            self.pon(y + 6, x + 3, "Cancelando…" if tarea.cancelar else "Esc cancela", self.at("dlg_tenue"))
+            self.scr.refresh()
+            try:
+                t = self.tecla()
+            except KeyboardInterrupt:  # Ctrl+C a media copia: cancelar limpiamente, no morir
+                t = "\x1b"
+            if t == "\x1b":
+                tarea.cancelar = True
+            elif t == curses.KEY_MOUSE:
+                self.lee_raton()
+        hilo.join()
+
+    # ── Visor ──
+
+    def visor(self, titulo, vista):
+        lineas, top, dx, busca, marca, textos = vista.lineas, 0, 0, "", -1, None
+
+        def pinta(final=True):
+            nonlocal top
+            self.H, self.W = H, W = self.scr.getmaxyx()
+            alto = max(1, H - 2)
+            top = max(0, min(top, len(lineas) - alto))
+            self.scr.erase()
+            self.pon(0, 0, " " * W, self.at("barra"))
+            dcha = f"{top + 1}-{min(len(lineas), top + alto)} de {len(lineas)} "
+            self.pon(0, W - len(dcha), dcha, self.at("barra"))
+            self.pon(0, 0, recorta(f" {titulo}" + (f" · {vista.info}" if vista.info else ""), W - len(dcha) - 1),
+                     self.at("barra"))
+            self.pinta_lineas(0, 1, W, alto, vista, top, dx, marca)
+            pie = " ↑↓ RePág AvPág Inicio Fin  ←→ desplazar  / buscar  n siguiente  q volver"
+            self.pon(H - 1, 0, ajusta(recorta(pie, W), W), self.at("ftxt"))
+            if final:
+                self.scr.refresh()
+            return alto
+
+        self.fondo = pinta
+        try:
+            while True:
+                alto = pinta()
+                self.scr.timeout(-1)
+                t = self.tecla()
+                K = curses
+                if t in ("q", "\x1b", "\n", "v", K.KEY_F3, K.KEY_F10, K.KEY_F1, ATRAS):
+                    return
+                if t in (K.KEY_UP, "k"):
+                    top -= 1
+                elif t in (K.KEY_DOWN, "j"):
+                    top += 1
+                elif t == K.KEY_PPAGE:
+                    top -= alto - 1
+                elif t in (K.KEY_NPAGE, " "):
+                    top += alto - 1
+                elif t == K.KEY_HOME:
+                    top = 0
+                elif t == K.KEY_END:
+                    top = len(lineas)
+                elif t == K.KEY_LEFT:
+                    dx = max(0, dx - 8)
+                elif t == K.KEY_RIGHT:
+                    dx += 8
+                elif t == K.KEY_MOUSE:
+                    top += 3 * sum(rueda for *_, rueda in self.lee_raton())
+                elif t in ("/", "n"):
+                    if t == "/" or not busca:
+                        busca = self.pedir("Buscar", "Texto a buscar:", busca) or busca
+                        if not busca:
+                            continue
+                    if textos is None:
+                        textos = [sin_acentos("".join(s for s, _ in lin).casefold()) for lin in lineas]
+                    aguja = sin_acentos(busca.casefold())
+                    desde = marca + 1 if marca >= top else top
+                    marca = next((i for i in [*range(desde, len(textos)), *range(desde)] if aguja in textos[i]), -1)
+                    if marca >= 0:
+                        top = marca - min(3, alto // 2)
+        finally:
+            self.fondo = self.dibuja
+
+    # ── Acciones ──
+
+    def ver(self):
+        e = self.actual()
+        if e is None or e.es_dir:
+            return
+        self.aviso = "Leyendo…"
+        self.dibuja()
+        self.aviso = ""
+        self.visor(e.visible, vista_fichero(e.ruta, e.st, self.W, self.H - 2, completa=True,
+                                            con_imagen=self.img_ok))
+
+    def externo(self, args, cwd=None, entorno=None, saludo=None):
+        """Suelta la pantalla, lanza un programa y la recupera al volver."""
+        curses.endwin()
+        error = None
+        try:
+            if saludo:
+                print(saludo, flush=True)
+            subprocess.call(args, cwd=cwd, env=entorno)
+        except OSError as e:
+            error = e.strerror or str(e)
+        except KeyboardInterrupt:
+            pass
+        self.scr.clear()
+        self.scr.refresh()
+        self.tras_cambio()
+        if error:
+            self.error("No se puede lanzar", [f"{args[0]}: {error}"])
+
+    def edita(self):
+        e = self.actual()
+        if e is None or e.es_dir:
+            return
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or \
+            next((p for p in ("nano", "vim", "vi") if shutil.which(p)), None)
+        if not editor:
+            self.error("Editar", ["No hay editor: define la variable EDITOR."])
+            return
+        self.externo(shlex.split(editor) + [e.ruta], cwd=self.cwd)
+        self.sel[self.cwd] = e.nombre
+
+    def shell(self):
+        shell = os.environ.get("SHELL") or "/bin/bash"
+        self.externo([shell], cwd=self.cwd, entorno={**os.environ, "CASCADA": "1"},
+                     saludo=f"cascada: shell en {abrevia(self.cwd)} · «exit» o Ctrl+D para volver")
+
+    def ir_a(self):
+        txt = self.pedir("Ir a", "Carpeta:", abrevia(self.cwd).rstrip("/") + "/", rutas=True)
+        if not txt:
+            return
+        ruta = os.path.normpath(os.path.join(self.cwd, os.path.expanduser(txt)))
+        if os.path.isdir(ruta):
+            self.cambia(ruta)
+        elif os.path.lexists(ruta):
+            self.cambia(os.path.dirname(ruta), os.path.basename(ruta))
+        else:
+            self.error("Ir a", [f"No existe {limpia(txt)}"])
+
+    def elige_lugar(self):
+        lista = sitios(self.favoritos)
+        w = max(ancho(et) for et, _, _ in lista)
+        i = self.menu("Sitios", [f"{ajusta(et, w)}  {limpia(abrevia(r))}" + (f"  ·  {det}" if det else "")
+                                 for et, r, det in lista])
+        if i >= 0:
+            self.cambia(lista[i][1])
+
+    def favorito(self):
+        """Pone o quita la carpeta actual de los favoritos del menú de sitios."""
+        if self.cwd in self.favoritos:
+            self.favoritos.remove(self.cwd)
+            self.aviso = f"{limpia(abrevia(self.cwd))} ya no está en favoritos"
+        else:
+            self.favoritos.append(self.cwd)
+            self.aviso = f"{limpia(abrevia(self.cwd))} añadida a favoritos: F9 (o u) para ir"
+        self.guarda_estado()
+
+    def renombra(self):
+        e = self.actual()
+        if e is None:
+            return
+        raiz = e.nombre if e.es_dir else os.path.splitext(e.nombre)[0]
+        nuevo = self.pedir("Renombrar", f"Nombre nuevo para {recorta_nombre(e.visible, 40)}:", e.nombre,
+                           cursor=len(raiz) or len(e.nombre))
+        if not nuevo or nuevo == e.nombre:
+            return
+        destino = os.path.join(self.cwd, nuevo)
+        if "/" in nuevo or nuevo in (".", ".."):
+            self.error("Renombrar", ["El nombre no puede llevar «/»."])
+        elif os.path.lexists(destino):
+            self.error("Renombrar", [f"Ya existe {limpia(nuevo)}."])
+        else:
+            try:
+                os.rename(e.ruta, destino)
+            except OSError as err:
+                self.error("Renombrar", [err.strerror or str(err)])
+            self.tras_cambio(nuevo)
+
+    def carpeta_nueva(self):
+        nombre = self.pedir("Carpeta nueva", "Nombre de la carpeta:")
+        if not nombre:
+            return
+        try:
+            os.makedirs(os.path.join(self.cwd, nombre))
+        except OSError as err:
+            self.error("Carpeta nueva", [err.strerror or str(err)])
+        self.tras_cambio(nombre.strip("/").split("/")[0])
+
+    @staticmethod
+    def cuantos(rutas):
+        return limpia(os.path.basename(rutas[0])) if len(rutas) == 1 else cuenta(len(rutas))
+
+    @staticmethod
+    def enumera(rutas, tope=6):
+        lineas = ["  " + recorta_nombre(limpia(os.path.basename(r)), 56) for r in rutas[:tope]]
+        if len(rutas) > tope:
+            lineas.append(f"  … y {len(rutas) - tope} más")
+        return lineas
+
+    def borrar(self, definitivo=False):
+        rutas = self.seleccion()
+        if not rutas:
+            return
+        if any(os.path.normpath(r) in ("/", HOME) for r in rutas):
+            self.error("Borrar", ["Eso no se borra desde aquí."])
+            return
+        if definitivo:
+            pregunta = ["¿Borrar DEFINITIVAMENTE? No se puede deshacer.", ""] + self.enumera(rutas)
+        else:
+            if self.confirmar("Borrar", ["¿Enviar a la papelera?", ""] + self.enumera(rutas),
+                              ("Papelera", "Cancelar")) != 0:
+                return
+            self.aviso = "Enviando a la papelera…"
+            self.dibuja()
+            fallo = a_la_papelera(rutas)
+            quedan = [r for r in rutas if os.path.lexists(r)]
+            self.tras_cambio()
+            self.aviso = f"{self.cuantos(rutas)}: a la papelera" if not quedan else ""
+            if not quedan:
+                return
+            rutas = quedan
+            pregunta = ["No se ha podido enviar a la papelera:", "  " + recorta(fallo, 60), ""] \
+                + self.enumera(rutas) + ["", "¿Borrar definitivamente? No se puede deshacer."]
+        if self.confirmar("Borrar definitivamente", pregunta, ("Borrar", "Cancelar"), 1, "dlg_err") != 0:
+            return
+        errores = []
+        for r in rutas:
+            try:
+                borra(r)
+            except OSError as e:
+                errores.append(f"{limpia(os.path.basename(r))}: {e.strerror or e}")
+        self.tras_cambio()
+        if errores:
+            self.error("Borrar", errores[:8])
+        else:
+            self.aviso = f"{self.cuantos(rutas)}: borrado"
+
+    def copia_a(self, mover):
+        rutas = self.seleccion()
+        if not rutas:
+            return
+        verbo = "Mover" if mover else "Copiar"
+        txt = self.pedir(verbo, f"{verbo} {self.cuantos(rutas)} a:", abrevia(self.cwd).rstrip("/") + "/",
+                         rutas=True)
+        if not txt:
+            return
+        destino = os.path.normpath(os.path.join(self.cwd, os.path.expanduser(txt)))
+        if os.path.isdir(destino) or txt.endswith("/") or len(rutas) > 1:
+            if not os.path.isdir(destino):
+                if self.confirmar(verbo, [f"No existe la carpeta {limpia(abrevia(destino))}.", "¿Crearla?"]) != 0:
+                    return
+                try:
+                    os.makedirs(destino)
+                except OSError as err:
+                    self.error(verbo, [err.strerror or str(err)])
+                    return
+            pares = [(r, os.path.join(destino, os.path.basename(r))) for r in rutas]
+        else:
+            pares = [(rutas[0], destino)]  # un solo origen y un nombre nuevo: copiar renombrando
+        self.transfiere(pares, mover)
+
+    def pega(self):
+        rutas, mover = self.porta
+        rutas = [r for r in rutas if os.path.lexists(r)]
+        if not rutas:
+            self.aviso = "No hay nada que pegar: copia con c o corta con x"
+            return
+        self.transfiere([(r, os.path.join(self.cwd, os.path.basename(r))) for r in rutas], mover)
+        if mover:
+            self.porta = ([], False)
+
+    def transfiere(self, pares, mover):
+        """Copia o mueve pares (origen, destino), preguntando antes qué hacer con lo que ya exista."""
+        verbo, plan, chocan, avisos = ("Mover" if mover else "Copiar"), [], [], []
+        for origen, destino in pares:
+            real_o = os.path.realpath(origen)
+            real_d = os.path.join(os.path.realpath(os.path.dirname(destino)), os.path.basename(destino))
+            if real_d == real_o:
+                if not mover:
+                    plan.append((origen, nombre_libre(destino), False))  # pegar en su sitio: duplicar
+            elif real_d.startswith(real_o.rstrip("/") + "/"):
+                avisos.append(f"{limpia(os.path.basename(origen))}: no cabe dentro de sí misma")
+            elif os.path.lexists(destino):
+                chocan.append((origen, destino))
+            else:
+                plan.append((origen, destino, False))
+        if chocan:
+            # Solo se pisa fichero sobre fichero; mezclar carpetas a ciegas es pedir un disgusto.
+            pisables = all(not os.path.isdir(o) and not os.path.isdir(d) for o, d in chocan)
+            botones = ("Conservar ambos",) + (("Sobrescribir",) if pisables else ()) + ("Saltar", "Cancelar")
+            r = self.confirmar(verbo, ["Ya existen en el destino:", ""] + self.enumera([d for _, d in chocan]),
+                               botones)
+            if r < 0 or botones[r] == "Cancelar":
+                return
+            if botones[r] == "Conservar ambos":
+                plan += [(o, nombre_libre(d), False) for o, d in chocan]
+            elif botones[r] == "Sobrescribir":
+                plan += [(o, d, True) for o, d in chocan]
+        tarea = Tarea(plan, mover)
+        if plan:
+            self.progreso(tarea, "Moviendo" if mover else "Copiando")
+        self.tras_cambio()
+        hechos = [d for d in tarea.hechos if os.path.dirname(d) == self.cwd]
+        if hechos:
+            self.sel[self.cwd] = os.path.basename(hechos[0])
+        errores = avisos + tarea.errores
+        if errores:
+            self.error(verbo, errores[:8] + ([f"… y {len(errores) - 8} errores más"] if len(errores) > 8 else []))
+        elif tarea.cancelar:
+            self.aviso = "Cancelado"
+        elif tarea.hechos:
+            self.aviso = f"{self.cuantos(tarea.hechos)}: {'movido' if mover else 'copiado'}"
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="cascada", description=__doc__, add_help=False,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, usage=argparse.SUPPRESS)
+    ap.add_argument("-h", "--help", action="help", help=argparse.SUPPRESS)
+    ap.add_argument("ruta", nargs="?", default=".", help=argparse.SUPPRESS)
+    ap.add_argument("--elegir-dir", metavar="FICHERO", help=argparse.SUPPRESS)
+    ap.add_argument("--shell", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--tema", choices=list(TEMAS), help=argparse.SUPPRESS)
+    ap.add_argument("--version", action="version", version=f"cascada {VERSION}", help=argparse.SUPPRESS)
+    args = ap.parse_args()
+    if args.shell:
+        print(FUNCION_SHELL)
+        return 0
+
+    ruta, sel = os.path.abspath(os.path.expanduser(args.ruta)), None
+    pwd_logico = os.environ.get("PWD")
+    if args.ruta == "." and pwd_logico:
+        try:
+            if os.path.samefile(pwd_logico, "."):
+                ruta = os.path.normpath(pwd_logico)  # respeta el camino por el que se llegó (enlaces)
+        except OSError:
+            pass
+    if not os.path.isdir(ruta):
+        if not os.path.lexists(ruta):
+            sys.exit(f"cascada: no existe {args.ruta}")
+        ruta, sel = os.path.split(ruta)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.exit("cascada: hace falta una terminal")
+
+    locale.setlocale(locale.LC_ALL, "")
+    warnings.simplefilter("ignore")  # un aviso de Pillow por stderr destrozaría la pantalla
+    try:
+        final = curses.wrapper(lambda scr: App(scr, ruta, sel, args.tema).bucle())
+    except KeyboardInterrupt:
+        return 130
+    if args.elegir_dir and final:
+        try:
+            Path(args.elegir_dir).write_text(final)
+        except OSError as e:
+            print(f"cascada: {e}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
